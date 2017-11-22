@@ -8,6 +8,8 @@ def get_hostname(default=socket.getfqdn):
 
     :param callable|str default: Default if config does not specify. If a callable is given it will be called.
     """
-    fallback = callable(default) and default() or default
-    hostname = conf.get('core', 'hostname', fallback=fallback)
+    try:
+        hostname = conf.get('core', 'hostname')
+    except AirflowConfigException:
+        hostname = callable(default) and default() or default
     return hostname
