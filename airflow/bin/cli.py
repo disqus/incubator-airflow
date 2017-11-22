@@ -22,7 +22,6 @@ import os
 import socket
 import subprocess
 import textwrap
-import warnings
 from importlib import import_module
 
 import argparse
@@ -41,6 +40,7 @@ import traceback
 import time
 import psutil
 import re
+from urllib.parse import urlunparse
 
 import airflow
 from airflow import api
@@ -54,9 +54,8 @@ from airflow.models import (DagModel, DagBag, TaskInstance,
 
 from airflow.ti_deps.dep_context import (DepContext, SCHEDULER_DEPS)
 from airflow.utils import db as db_utils
-from airflow.utils import logging as logging_utils
-from airflow.utils.file import mkdirs
 from airflow.utils.net import get_hostname
+from airflow.utils.log.logging_mixin import LoggingMixin, redirect_stderr, redirect_stdout
 from airflow.www.app import cached_app
 
 from sqlalchemy import func
@@ -66,6 +65,8 @@ api.load_auth()
 api_module = import_module(conf.get('cli', 'api_client'))
 api_client = api_module.Client(api_base_url=conf.get('cli', 'endpoint_url'),
                                auth=api.api_auth.client_auth)
+
+log = LoggingMixin().log
 
 
 def sigint_handler(sig, frame):
@@ -190,19 +191,21 @@ def trigger_dag(args):
     :param args:
     :return:
     """
+    log = LoggingMixin().log
     try:
         message = api_client.trigger_dag(dag_id=args.dag_id,
                                          run_id=args.run_id,
                                          conf=args.conf,
                                          execution_date=args.exec_date)
     except IOError as err:
-        logging.error(err)
+        log.error(err)
         raise AirflowException(err)
-
-    logging.info(message)
+    log.info(message)
 
 
 def pool(args):
+    log = LoggingMixin().log
+
     def _tabulate(pools):
         return "\n%s" % tabulate(pools, ['Pool', 'Slots', 'Description'],
                                  tablefmt="fancy_grid")
@@ -219,9 +222,9 @@ def pool(args):
         else:
             pools = api_client.get_pools()
     except (AirflowException, IOError) as err:
-        logging.error(err)
+        log.error(err)
     else:
-        logging.info(_tabulate(pools=pools))
+        log.info(_tabulate(pools=pools))
 
 
 def variables(args):
@@ -325,9 +328,12 @@ def run(args, dag=None):
     # Disable connection pooling to reduce the # of connections on the DB
     # while it's waiting for the task to finish.
     settings.configure_orm(disable_connection_pool=True)
+
     db_utils.pessimistic_connection_handling()
     if dag:
         args.dag_id = dag.dag_id
+
+    log = LoggingMixin().log
 
     # Load custom airflow config
     if args.cfg_path:
@@ -347,7 +353,7 @@ def run(args, dag=None):
         dag = get_dag(args)
     elif not dag:
         session = settings.Session()
-        logging.info('Loading pickle id {args.pickle}'.format(args=args))
+        log.info('Loading pickle id {args.pickle}'.format(args=args))
         dag_pickle = session.query(
             DagPickle).filter(DagPickle.id == args.pickle).first()
         if not dag_pickle:
@@ -358,155 +364,84 @@ def run(args, dag=None):
     ti = TaskInstance(task, args.execution_date)
     ti.refresh_from_db()
 
-    logging.root.handlers = []
+    log = logging.getLogger('airflow.task')
     if args.raw:
-        # Output to STDOUT for the parent process to read and log
-        logging.basicConfig(
-            stream=sys.stdout,
-            level=settings.LOGGING_LEVEL,
-            format=settings.LOG_FORMAT)
-    else:
-        # Setting up logging to a file.
+        log = logging.getLogger('airflow.task.raw')
 
-        # To handle log writing when tasks are impersonated, the log files need to
-        # be writable by the user that runs the Airflow command and the user
-        # that is impersonated. This is mainly to handle corner cases with the
-        # SubDagOperator. When the SubDagOperator is run, all of the operators
-        # run under the impersonated user and create appropriate log files
-        # as the impersonated user. However, if the user manually runs tasks
-        # of the SubDagOperator through the UI, then the log files are created
-        # by the user that runs the Airflow command. For example, the Airflow
-        # run command may be run by the `airflow_sudoable` user, but the Airflow
-        # tasks may be run by the `airflow` user. If the log files are not
-        # writable by both users, then it's possible that re-running a task
-        # via the UI (or vice versa) results in a permission error as the task
-        # tries to write to a log file created by the other user.
-        try_number = ti.try_number
-        log_base = os.path.expanduser(conf.get('core', 'BASE_LOG_FOLDER'))
-        log_relative_dir = logging_utils.get_log_directory(args.dag_id, args.task_id,
-                                                           args.execution_date)
-        directory = os.path.join(log_base, log_relative_dir)
-        # Create the log file and give it group writable permissions
-        # TODO(aoen): Make log dirs and logs globally readable for now since the SubDag
-        # operator is not compatible with impersonation (e.g. if a Celery executor is used
-        # for a SubDag operator and the SubDag operator has a different owner than the
-        # parent DAG)
-        if not os.path.isdir(directory):
-            # Create the directory as globally writable using custom mkdirs
-            # as os.makedirs doesn't set mode properly.
-            mkdirs(directory, 0o775)
-        log_relative = logging_utils.get_log_filename(
-            args.dag_id, args.task_id, args.execution_date, try_number)
-        filename = os.path.join(log_base, log_relative)
-
-        if not os.path.exists(filename):
-            open(filename, "a").close()
-            os.chmod(filename, 0o666)
-
-        logging.basicConfig(
-            filename=filename,
-            level=settings.LOGGING_LEVEL,
-            format=settings.LOG_FORMAT)
+    for handler in log.handlers:
+        try:
+            handler.set_context(ti)
+        except AttributeError:
+            # Not all handlers need to have context passed in so we ignore
+            # the error when handlers do not have set_context defined.
+            pass
 
     hostname = get_hostname()
-    logging.info("Running on host {}".format(hostname))
+    log.info("Running on host %s", hostname)
 
-    if args.local:
-        print("Logging into: " + filename)
-        run_job = jobs.LocalTaskJob(
-            task_instance=ti,
-            mark_success=args.mark_success,
-            pickle_id=args.pickle,
-            ignore_all_deps=args.ignore_all_dependencies,
-            ignore_depends_on_past=args.ignore_depends_on_past,
-            ignore_task_deps=args.ignore_dependencies,
-            ignore_ti_state=args.force,
-            pool=args.pool)
-        run_job.run()
-    elif args.raw:
-        ti.run(
-            mark_success=args.mark_success,
-            ignore_all_deps=args.ignore_all_dependencies,
-            ignore_depends_on_past=args.ignore_depends_on_past,
-            ignore_task_deps=args.ignore_dependencies,
-            ignore_ti_state=args.force,
-            job_id=args.job_id,
-            pool=args.pool,
-        )
-    else:
-        pickle_id = None
-        if args.ship_dag:
-            try:
-                # Running remotely, so pickling the DAG
-                session = settings.Session()
-                pickle = DagPickle(dag)
-                session.add(pickle)
-                session.commit()
-                pickle_id = pickle.id
-                print((
-                          'Pickled dag {dag} '
-                          'as pickle_id:{pickle_id}').format(**locals()))
-            except Exception as e:
-                print('Could not pickle the DAG')
-                print(e)
-                raise e
+    with redirect_stdout(log, logging.INFO), redirect_stderr(log, logging.WARN):
+        if args.local:
+            run_job = jobs.LocalTaskJob(
+                task_instance=ti,
+                mark_success=args.mark_success,
+                pickle_id=args.pickle,
+                ignore_all_deps=args.ignore_all_dependencies,
+                ignore_depends_on_past=args.ignore_depends_on_past,
+                ignore_task_deps=args.ignore_dependencies,
+                ignore_ti_state=args.force,
+                pool=args.pool)
+            run_job.run()
+        elif args.raw:
+            ti._run_raw_task(
+                mark_success=args.mark_success,
+                job_id=args.job_id,
+                pool=args.pool,
+            )
+        else:
+            pickle_id = None
+            if args.ship_dag:
+                try:
+                    # Running remotely, so pickling the DAG
+                    session = settings.Session()
+                    pickle = DagPickle(dag)
+                    session.add(pickle)
+                    session.commit()
+                    pickle_id = pickle.id
+                    # TODO: This should be written to a log
+                    print((
+                              'Pickled dag {dag} '
+                              'as pickle_id:{pickle_id}').format(**locals()))
+                except Exception as e:
+                    print('Could not pickle the DAG')
+                    print(e)
+                    raise e
 
-        executor = GetDefaultExecutor()
-        executor.start()
-        print("Sending to executor.")
-        executor.queue_task_instance(
-            ti,
-            mark_success=args.mark_success,
-            pickle_id=pickle_id,
-            ignore_all_deps=args.ignore_all_dependencies,
-            ignore_depends_on_past=args.ignore_depends_on_past,
-            ignore_task_deps=args.ignore_dependencies,
-            ignore_ti_state=args.force,
-            pool=args.pool)
-        executor.heartbeat()
-        executor.end()
+            executor = GetDefaultExecutor()
+            executor.start()
+            print("Sending to executor.")
+            executor.queue_task_instance(
+                ti,
+                mark_success=args.mark_success,
+                pickle_id=pickle_id,
+                ignore_all_deps=args.ignore_all_dependencies,
+                ignore_depends_on_past=args.ignore_depends_on_past,
+                ignore_task_deps=args.ignore_dependencies,
+                ignore_ti_state=args.force,
+                pool=args.pool)
+            executor.heartbeat()
+            executor.end()
 
     # Child processes should not flush or upload to remote
     if args.raw:
         return
 
-    # Force the log to flush, and set the handler to go back to normal so we
-    # don't continue logging to the task's log file. The flush is important
-    # because we subsequently read from the log to insert into S3 or Google
-    # cloud storage.
-    logging.root.handlers[0].flush()
-    logging.root.handlers = []
-
-    # store logs remotely
-    remote_base = conf.get('core', 'REMOTE_BASE_LOG_FOLDER')
-
-    # deprecated as of March 2016
-    if not remote_base and conf.get('core', 'S3_LOG_FOLDER'):
-        warnings.warn(
-            'The S3_LOG_FOLDER conf key has been replaced by '
-            'REMOTE_BASE_LOG_FOLDER. Your conf still works but please '
-            'update airflow.cfg to ensure future compatibility.',
-            DeprecationWarning)
-        remote_base = conf.get('core', 'S3_LOG_FOLDER')
-
-    if os.path.exists(filename):
-        # read log and remove old logs to get just the latest additions
-
-        with open(filename, 'r') as logfile:
-            log = logfile.read()
-
-        remote_log_location = os.path.join(remote_base, log_relative)
-        logging.debug("Uploading to remote log location {}".format(remote_log_location))
-        # S3
-        if remote_base.startswith('s3:/'):
-            logging_utils.S3Log().write(log, remote_log_location)
-        # GCS
-        elif remote_base.startswith('gs:/'):
-            logging_utils.GCSLog().write(log, remote_log_location)
-        # Other
-        elif remote_base and remote_base != 'None':
-            logging.error(
-                'Unsupported remote log location: {}'.format(remote_base))
+    # Force the log to flush. The flush is important because we
+    # might subsequently read from the log to insert into S3 or
+    # Google cloud storage. Explicitly close the handler is
+    # needed in order to upload to remote storage services.
+    for handler in log.handlers:
+        handler.flush()
+        handler.close()
 
 
 def task_failed_deps(args):
@@ -526,6 +461,7 @@ def task_failed_deps(args):
 
     dep_context = DepContext(deps=SCHEDULER_DEPS)
     failed_deps = list(ti.get_failed_dep_statuses(dep_context=dep_context))
+    # TODO, Do we want to print or log this
     if failed_deps:
         print("Task instance dependencies not met:")
         for dep in failed_deps:
@@ -682,8 +618,7 @@ def restart_workers(gunicorn_master_proc, num_workers_expected):
 
     def start_refresh(gunicorn_master_proc):
         batch_size = conf.getint('webserver', 'worker_refresh_batch_size')
-        logging.debug('%s doing a refresh of %s workers',
-                      state, batch_size)
+        log.debug('%s doing a refresh of %s workers', state, batch_size)
         sys.stdout.flush()
         sys.stderr.flush()
 
@@ -705,14 +640,14 @@ def restart_workers(gunicorn_master_proc, num_workers_expected):
 
         # Whenever some workers are not ready, wait until all workers are ready
         if num_ready_workers_running < num_workers_running:
-            logging.debug('%s some workers are starting up, waiting...', state)
+            log.debug('%s some workers are starting up, waiting...', state)
             sys.stdout.flush()
             time.sleep(1)
 
         # Kill a worker gracefully by asking gunicorn to reduce number of workers
         elif num_workers_running > num_workers_expected:
             excess = num_workers_running - num_workers_expected
-            logging.debug('%s killing %s workers', state, excess)
+            log.debug('%s killing %s workers', state, excess)
 
             for _ in range(excess):
                 gunicorn_master_proc.send_signal(signal.SIGTTOU)
@@ -723,7 +658,7 @@ def restart_workers(gunicorn_master_proc, num_workers_expected):
         # Start a new worker by asking gunicorn to increase number of workers
         elif num_workers_running == num_workers_expected:
             refresh_interval = conf.getint('webserver', 'worker_refresh_interval')
-            logging.debug(
+            log.debug(
                 '%s sleeping for %ss starting doing a refresh...',
                 state, refresh_interval
             )
@@ -732,7 +667,7 @@ def restart_workers(gunicorn_master_proc, num_workers_expected):
 
         else:
             # num_ready_workers_running == num_workers_running < num_workers_expected
-            logging.error((
+            log.error((
                 "%s some workers seem to have died and gunicorn"
                 "did not restart them as expected"
             ), state)
@@ -792,7 +727,7 @@ def webserver(args):
             '-b', args.hostname + ':' + str(args.port),
             '-n', 'airflow-webserver',
             '-p', str(pid),
-            '-c', 'airflow.www.gunicorn_config'
+            '-c', 'python:airflow.www.gunicorn_config'
         ]
 
         if args.access_logfile:
@@ -847,7 +782,7 @@ def webserver(args):
                             gunicorn_master_proc_pid = int(f.read())
                             break
                     except IOError:
-                        logging.debug("Waiting for gunicorn's pid file to be created.")
+                        log.debug("Waiting for gunicorn's pid file to be created.")
                         time.sleep(0.1)
 
                 gunicorn_master_proc = psutil.Process(gunicorn_master_proc_pid)
@@ -931,6 +866,7 @@ def worker(args):
         'O': 'fair',
         'queues': args.queues,
         'concurrency': args.concurrency,
+        'hostname': args.celery_hostname,
     }
 
     if args.daemon:
@@ -973,8 +909,6 @@ def resetdb(args):
     if args.yes or input(
         "This will drop existing tables if they exist. "
         "Proceed? (y/n)").upper() == "Y":
-        logging.basicConfig(level=settings.LOGGING_LEVEL,
-                            format=settings.SIMPLE_LOG_FORMAT)
         db_utils.resetdb()
     else:
         print("Bail.")
@@ -1001,11 +935,15 @@ def version(args):  # noqa
     print(settings.HEADER + "  v" + airflow.__version__)
 
 
+alternative_conn_specs = ['conn_type', 'conn_host',
+                          'conn_login', 'conn_password', 'conn_schema', 'conn_port']
+
+
 def connections(args):
     if args.list:
         # Check that no other flags were passed to the command
         invalid_args = list()
-        for arg in ['conn_id', 'conn_uri', 'conn_extra']:
+        for arg in ['conn_id', 'conn_uri', 'conn_extra'] + alternative_conn_specs:
             if getattr(args, arg) is not None:
                 invalid_args.append(arg)
         if invalid_args:
@@ -1030,7 +968,7 @@ def connections(args):
     if args.delete:
         # Check that only the `conn_id` arg was passed to the command
         invalid_args = list()
-        for arg in ['conn_uri', 'conn_extra']:
+        for arg in ['conn_uri', 'conn_extra'] + alternative_conn_specs:
             if getattr(args, arg) is not None:
                 invalid_args.append(arg)
         if invalid_args:
@@ -1074,16 +1012,32 @@ def connections(args):
     if args.add:
         # Check that the conn_id and conn_uri args were passed to the command:
         missing_args = list()
-        for arg in ['conn_id', 'conn_uri']:
-            if getattr(args, arg) is None:
-                missing_args.append(arg)
+        invalid_args = list()
+        if not args.conn_id:
+            missing_args.append('conn_id')
+        if args.conn_uri:
+            for arg in alternative_conn_specs:
+                if getattr(args, arg) is not None:
+                    invalid_args.append(arg)
+        elif not args.conn_type:
+            missing_args.append('conn_uri or conn_type')
         if missing_args:
             msg = ('\n\tThe following args are required to add a connection:' +
                    ' {missing!r}\n'.format(missing=missing_args))
             print(msg)
+        if invalid_args:
+            msg = ('\n\tThe following args are not compatible with the ' +
+                   '--add flag and --conn_uri flag: {invalid!r}\n')
+            msg = msg.format(invalid=invalid_args)
+            print(msg)
+        if missing_args or invalid_args:
             return
 
-        new_conn = Connection(conn_id=args.conn_id, uri=args.conn_uri)
+        if args.conn_uri:
+            new_conn = Connection(conn_id=args.conn_id, uri=args.conn_uri)
+        else:
+            new_conn = Connection(conn_id=args.conn_id, conn_type=args.conn_type, host=args.conn_host,
+                                  login=args.conn_login, password=args.conn_password, schema=args.conn_schema, port=args.conn_port)
         if args.conn_extra is not None:
             new_conn.set_extra(args.conn_extra)
 
@@ -1094,7 +1048,8 @@ def connections(args):
             session.add(new_conn)
             session.commit()
             msg = '\n\tSuccessfully added `conn_id`={conn_id} : {uri}\n'
-            msg = msg.format(conn_id=new_conn.conn_id, uri=args.conn_uri)
+            msg = msg.format(conn_id=new_conn.conn_id, uri=args.conn_uri or urlunparse((args.conn_type, '{login}:{password}@{host}:{port}'.format(
+                login=args.conn_login or '', password=args.conn_password or '', host=args.conn_host or '', port=args.conn_port or ''), args.conn_schema or '', '', '', '')))
             print(msg)
         else:
             msg = '\n\tA connection with `conn_id`={conn_id} already exists\n'
@@ -1450,6 +1405,10 @@ class CLIFactory(object):
             type=int,
             help="The number of worker processes",
             default=conf.get('celery', 'celeryd_concurrency')),
+        'celery_hostname': Arg(
+            ("-cn", "--celery_hostname"),
+            help=("Set the hostname of celery worker "
+                  "if you have multiple workers on a single machine.")),
         # flower
         'broker_api': Arg(("-a", "--broker_api"), help="Broker api"),
         'flower_hostname': Arg(
@@ -1486,7 +1445,31 @@ class CLIFactory(object):
             type=str),
         'conn_uri': Arg(
             ('--conn_uri',),
-            help='Connection URI, required to add a connection',
+            help='Connection URI, required to add a connection without conn_type',
+            type=str),
+        'conn_type': Arg(
+            ('--conn_type',),
+            help='Connection type, required to add a connection without conn_uri',
+            type=str),
+        'conn_host': Arg(
+            ('--conn_host',),
+            help='Connection host, optional when adding a connection',
+            type=str),
+        'conn_login': Arg(
+            ('--conn_login',),
+            help='Connection login, optional when adding a connection',
+            type=str),
+        'conn_password': Arg(
+            ('--conn_password',),
+            help='Connection password, optional when adding a connection',
+            type=str),
+        'conn_schema': Arg(
+            ('--conn_schema',),
+            help='Connection schema, optional when adding a connection',
+            type=str),
+        'conn_port': Arg(
+            ('--conn_port',),
+            help='Connection port, optional when adding a connection',
             type=str),
         'conn_extra': Arg(
             ('--conn_extra',),
@@ -1609,7 +1592,7 @@ class CLIFactory(object):
         }, {
             'func': worker,
             'help': "Start a Celery worker node",
-            'args': ('do_pickle', 'queues', 'concurrency',
+            'args': ('do_pickle', 'queues', 'concurrency', 'celery_hostname',
                      'pid', 'daemon', 'stdout', 'stderr', 'log_file'),
         }, {
             'func': flower,
@@ -1624,7 +1607,7 @@ class CLIFactory(object):
             'func': connections,
             'help': "List/Add/Delete connections",
             'args': ('list_connections', 'add_connection', 'delete_connection',
-                     'conn_id', 'conn_uri', 'conn_extra'),
+                     'conn_id', 'conn_uri', 'conn_extra') + tuple(alternative_conn_specs),
         },
     )
     subparsers_dict = {sp['func'].__name__: sp for sp in subparsers}

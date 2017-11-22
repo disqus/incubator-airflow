@@ -17,15 +17,36 @@ from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
 
-from datetime import datetime
 from functools import wraps
-import logging
+
 import os
+import contextlib
 
 from sqlalchemy import event, exc
 from sqlalchemy.pool import Pool
 
 from airflow import settings
+from airflow.utils.log.logging_mixin import LoggingMixin
+
+log = LoggingMixin().log
+
+
+@contextlib.contextmanager
+def create_session():
+    """
+    Contextmanager that will create and teardown a session.
+    """
+    session = settings.Session()
+    try:
+        yield session
+        session.expunge_all()
+        session.commit()
+    except:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
 
 def provide_session(func):
     """
@@ -36,21 +57,20 @@ def provide_session(func):
     """
     @wraps(func)
     def wrapper(*args, **kwargs):
-        needs_session = False
         arg_session = 'session'
+
         func_params = func.__code__.co_varnames
         session_in_args = arg_session in func_params and \
             func_params.index(arg_session) < len(args)
-        if not (arg_session in kwargs or session_in_args):
-            needs_session = True
-            session = settings.Session()
-            kwargs[arg_session] = session
-        result = func(*args, **kwargs)
-        if needs_session:
-            session.expunge_all()
-            session.commit()
-            session.close()
-        return result
+        session_in_kwargs = arg_session in kwargs
+
+        if session_in_kwargs or session_in_args:
+            return func(*args, **kwargs)
+        else:
+            with create_session() as session:
+                kwargs[arg_session] = session
+                return func(*args, **kwargs)
+
     return wrapper
 
 
@@ -199,6 +219,10 @@ def initdb():
             host='yarn', extra='{"queue": "root.default"}'))
     merge_conn(
         models.Connection(
+            conn_id='druid_ingest_default', conn_type='druid',
+            host='druid-overlord', port=8081, extra='{"endpoint": "druid/indexer/v1/task"}'))
+    merge_conn(
+        models.Connection(
             conn_id='redis_default', conn_type='redis',
             host='localhost', port=6379,
             extra='{"db": 0}'))
@@ -257,6 +281,10 @@ def initdb():
         models.Connection(
             conn_id='databricks_default', conn_type='databricks',
             host='localhost'))
+    merge_conn(
+        models.Connection(
+            conn_id='qubole_default', conn_type='qubole',
+            host= 'localhost'))
 
     # Known event types
     KET = models.KnownEventType
@@ -274,9 +302,8 @@ def initdb():
 
     dagbag = models.DagBag()
     # Save individual DAGs in the ORM
-    now = datetime.utcnow()
     for dag in dagbag.dags.values():
-        models.DAG.sync_to_db(dag, dag.owner, now)
+        dag.sync_to_db()
     # Deactivate the unknown ones
     models.DAG.deactivate_unknown_dags(dagbag.dags.keys())
 
@@ -304,7 +331,8 @@ def upgradedb():
     from alembic import command
     from alembic.config import Config
 
-    logging.info("Creating tables")
+    log.info("Creating tables")
+
     current_dir = os.path.dirname(os.path.abspath(__file__))
     package_dir = os.path.normpath(os.path.join(current_dir, '..'))
     directory = os.path.join(package_dir, 'migrations')
@@ -322,7 +350,8 @@ def resetdb():
     # alembic adds significant import time, so we import it lazily
     from alembic.migration import MigrationContext
 
-    logging.info("Dropping tables that exist")
+    log.info("Dropping tables that exist")
+
     models.Base.metadata.drop_all(settings.engine)
     mc = MigrationContext.configure(settings.engine)
     if mc._version.exists(settings.engine):

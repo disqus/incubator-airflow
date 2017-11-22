@@ -12,18 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-import logging
 import os
 import subprocess
 import re
 
 from airflow.hooks.base_hook import BaseHook
 from airflow.exceptions import AirflowException
+from airflow.utils.log.logging_mixin import LoggingMixin
 
-log = logging.getLogger(__name__)
 
-
-class SparkSubmitHook(BaseHook):
+class SparkSubmitHook(BaseHook, LoggingMixin):
     """
     This hook is a wrapper around the spark-submit binary to kick off a spark-submit job.
     It requires that the "spark-submit" binary is in the PATH or the spark_home to be
@@ -38,10 +36,18 @@ class SparkSubmitHook(BaseHook):
     :type files: str
     :param py_files: Additional python files used by the job, can be .zip, .egg or .py.
     :type py_files: str
+    :param driver_classpath: Additional, driver-specific, classpath settings.
+    :type driver_classpath: str
     :param jars: Submit additional jars to upload and place them in executor classpath.
     :type jars: str
     :param java_class: the main class of the Java application
     :type java_class: str
+    :param packages: Comma-separated list of maven coordinates of jars to include on the driver and executor classpaths
+    :type packages: str
+    :param exclude_packages: Comma-separated list of maven coordinates of jars to exclude while resolving the dependencies provided in 'packages'
+    :type exclude_packages: str
+    :param repositories: Comma-separated list of additional remote repositories to search for the maven coordinates given with 'packages'
+    :type repositories: str
     :param total_executor_cores: (Standalone & Mesos only) Total cores for all executors (Default: all the available cores on the worker)
     :type total_executor_cores: int
     :param executor_cores: (Standalone & YARN only) Number of cores per executor (Default: 2)
@@ -63,14 +69,17 @@ class SparkSubmitHook(BaseHook):
     :param verbose: Whether to pass the verbose flag to spark-submit process for debugging
     :type verbose: bool
     """
-
     def __init__(self,
                  conf=None,
                  conn_id='spark_default',
                  files=None,
                  py_files=None,
+                 driver_classpath=None,
                  jars=None,
                  java_class=None,
+                 packages=None,
+                 exclude_packages=None,
+                 repositories=None,
                  total_executor_cores=None,
                  executor_cores=None,
                  executor_memory=None,
@@ -85,8 +94,12 @@ class SparkSubmitHook(BaseHook):
         self._conn_id = conn_id
         self._files = files
         self._py_files = py_files
+        self._driver_classpath = driver_classpath
         self._jars = jars
         self._java_class = java_class
+        self._packages = packages
+        self._exclude_packages = exclude_packages
+        self._repositories = repositories
         self._total_executor_cores = total_executor_cores
         self._executor_cores = executor_cores
         self._executor_memory = executor_memory
@@ -126,10 +139,9 @@ class SparkSubmitHook(BaseHook):
             conn_data['spark_home'] = extra.get('spark-home', None)
             conn_data['spark_binary'] = extra.get('spark-binary', 'spark-submit')
         except AirflowException:
-            logging.debug(
-                "Could not load connection string {}, defaulting to {}".format(
-                    self._conn_id, conn_data['master']
-                )
+            self.log.debug(
+                "Could not load connection string %s, defaulting to %s",
+                self._conn_id, conn_data['master']
             )
 
         return conn_data
@@ -162,8 +174,16 @@ class SparkSubmitHook(BaseHook):
             connection_cmd += ["--files", self._files]
         if self._py_files:
             connection_cmd += ["--py-files", self._py_files]
+        if self._driver_classpath:
+            connection_cmd += ["--driver-classpath", self._driver_classpath]
         if self._jars:
             connection_cmd += ["--jars", self._jars]
+        if self._packages:
+            connection_cmd += ["--packages", self._packages]
+        if self._exclude_packages:
+            connection_cmd += ["--exclude-packages", self._exclude_packages]
+        if self._repositories:
+            connection_cmd += ["--repositories", self._repositories]
         if self._num_executors:
             connection_cmd += ["--num-executors", str(self._num_executors)]
         if self._total_executor_cores:
@@ -196,7 +216,7 @@ class SparkSubmitHook(BaseHook):
         if self._application_args:
             connection_cmd += self._application_args
 
-        logging.debug("Spark-Submit cmd: {}".format(connection_cmd))
+        self.log.debug("Spark-Submit cmd: %s", connection_cmd)
 
         return connection_cmd
 
@@ -243,15 +263,15 @@ class SparkSubmitHook(BaseHook):
                     self._yarn_application_id = match.groups()[0]
 
             # Pass to logging
-            logging.info(line)
+            self.log.info(line)
 
     def on_kill(self):
         if self._sp and self._sp.poll() is None:
-            logging.info('Sending kill signal to {}'.format(self._connection['spark_binary']))
+            self.log.info('Sending kill signal to %s', self._connection['spark_binary'])
             self._sp.kill()
 
             if self._yarn_application_id:
-                logging.info('Killing application on YARN')
+                self.log.info('Killing application on YARN')
                 kill_cmd = "yarn application -kill {0}".format(self._yarn_application_id).split()
                 yarn_kill = subprocess.Popen(kill_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                logging.info("YARN killed with return code: {0}".format(yarn_kill.wait()))
+                self.log.info("YARN killed with return code: %s", yarn_kill.wait())
