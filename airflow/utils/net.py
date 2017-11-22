@@ -8,9 +8,6 @@ def get_hostname(default=socket.getfqdn):
 
     :param callable|str default: Default if config does not specify. If a callable is given it will be called.
     """
-    try:
-        # If this is called `get`, why does it not match python semantics?
-        hostname = conf.get('core', 'hostname')
-    except AirflowConfigException:
-        hostname = callable(default) and default() or default
+    fallback = callable(default) and default() or default
+    hostname = conf.get('core', 'hostname', fallback=fallback)
     return hostname
