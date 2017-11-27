@@ -25,6 +25,7 @@
 from future.standard_library import install_aliases
 
 from airflow.utils.log.logging_mixin import LoggingMixin
+from airflow.utils.net import get_hostname
 
 install_aliases()
 
@@ -41,7 +42,6 @@ from flask import g
 from functools import wraps
 
 from requests_kerberos import HTTPKerberosAuth
-from socket import getfqdn
 
 client_auth = HTTPKerberosAuth(service='airflow')
 
@@ -55,7 +55,7 @@ def init_app(app):
 
     hostname = app.config.get('SERVER_NAME')
     if not hostname:
-        hostname = getfqdn()
+        hostname = get_hostname()
     log.info("Kerberos: hostname %s", hostname)
 
     service = 'airflow'

@@ -54,6 +54,7 @@ from airflow.models import (DagModel, DagBag, TaskInstance,
 
 from airflow.ti_deps.dep_context import (DepContext, SCHEDULER_DEPS)
 from airflow.utils import db as db_utils
+from airflow.utils.net import get_hostname
 from airflow.utils.log.logging_mixin import LoggingMixin, redirect_stderr, redirect_stdout
 from airflow.www.app import cached_app
 
@@ -375,7 +376,7 @@ def run(args, dag=None):
             # the error when handlers do not have set_context defined.
             pass
 
-    hostname = socket.getfqdn()
+    hostname = get_hostname()
     log.info("Running on host %s", hostname)
 
     with redirect_stdout(log, logging.INFO), redirect_stderr(log, logging.WARN):

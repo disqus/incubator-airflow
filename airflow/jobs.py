@@ -59,6 +59,7 @@ from airflow.utils.db import (
 from airflow.utils.email import send_email
 from airflow.utils.log.logging_mixin import LoggingMixin, StreamLogWriter
 from airflow.utils.state import State
+from airflow.utils.net import get_hostname
 
 Base = models.Base
 ID_LEN = models.ID_LEN
@@ -99,7 +100,7 @@ class BaseJob(Base, LoggingMixin):
             executor=executors.GetDefaultExecutor(),
             heartrate=conf.getfloat('scheduler', 'JOB_HEARTBEAT_SEC'),
             *args, **kwargs):
-        self.hostname = socket.getfqdn()
+        self.hostname = get_hostname()
         self.executor = executor
         self.executor_class = executor.__class__.__name__
         self.start_date = timezone.utcnow()
@@ -2558,7 +2559,7 @@ class LocalTaskJob(BaseJob):
         self.task_instance.refresh_from_db()
         ti = self.task_instance
 
-        fqdn = socket.getfqdn()
+        fqdn = get_hostname()
         same_hostname = fqdn == ti.hostname
         same_process = ti.pid == os.getpid()
 
