@@ -55,7 +55,8 @@ from airflow.models import (DagModel, DagBag, TaskInstance,
 from airflow.ti_deps.dep_context import (DepContext, SCHEDULER_DEPS)
 from airflow.utils import db as db_utils
 from airflow.utils.net import get_hostname
-from airflow.utils.log.logging_mixin import LoggingMixin, redirect_stderr, redirect_stdout
+from airflow.utils.log.logging_mixin import (LoggingMixin, redirect_stderr,
+                                             redirect_stdout, set_context)
 from airflow.www.app import cached_app
 
 from sqlalchemy import func
@@ -377,7 +378,7 @@ def run(args, dag=None):
             pass
 
     hostname = get_hostname()
-    log.info("Running on host %s", hostname)
+    log.info("Running %s on host %s", ti, hostname)
 
     with redirect_stdout(log, logging.INFO), redirect_stderr(log, logging.WARN):
         if args.local:

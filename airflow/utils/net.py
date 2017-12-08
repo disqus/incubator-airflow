@@ -12,7 +12,7 @@
 # limitations under the License.
 #
 from airflow import configuration
-from airflow.configuration import conf
+from airflow.configuration import (conf, AirflowConfigException)
 import socket
 
 
@@ -26,7 +26,12 @@ def get_hostname(default=socket.getfqdn):
     :param callable|str default: Default if config does not specify. If a callable is given it will be called.
     """
 
-    hostname = conf.get('core', 'hostname', fallback=_sentinel)
+    hostname = _sentinel
+
+    try:
+        hostname = conf.get('core', 'hostname', fallback=_sentinel)
+    except AirflowConfigException:
+        pass
 
     if hostname is _sentinel:
         hostname = default() if callable(default) else default
