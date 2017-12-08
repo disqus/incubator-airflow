@@ -26,11 +26,9 @@ def get_hostname(default=socket.getfqdn):
     :param callable|str default: Default if config does not specify. If a callable is given it will be called.
     """
 
-    hostname = _sentinel
-    if configuration.has_option('core', 'hostname'):
-        hostname = conf.get('core', 'hostname') or _sentinel
+    hostname = conf.get('core', 'hostname', fallback=_sentinel)
 
     if hostname is _sentinel:
-        hostname = callable(default) and default() or default
+        hostname = default() if callable(default) else default
 
     return hostname
