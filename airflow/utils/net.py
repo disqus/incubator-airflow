@@ -21,13 +21,12 @@ _sentinel = object()
 
 def get_hostname(default=socket.getfqdn):
     """
-    Replacement for `socket.getfqdn` that allows configuration to override it's
-    value.
+    A replacement for `socket.getfqdn` that allows configuration to override it's value.
 
-    :param callable|str default: If config does not specify, return this value. If callable, it will be called.
+    :param callable|str default: Default if config does not specify. If a callable is given it will be called.
     """
-    hostname = _sentinel
 
+    hostname = _sentinel
     if configuration.has_option('core', 'hostname'):
         hostname = conf.get('core', 'hostname') or _sentinel
 
